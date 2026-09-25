@@ -1,8 +1,8 @@
-from fastapi import FastAPI
+"""本地内存撮合与风控订单执行服务入口。
 
-app = FastAPI()
+运行：uv run fastapi dev main.py  或  uv run uvicorn main:app
+"""
 
+from app.api import app
 
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+__all__ = ["app"]
