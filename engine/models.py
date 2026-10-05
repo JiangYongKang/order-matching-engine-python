@@ -15,6 +15,12 @@ class OrderType(enum.Enum):
     MARKET = "MARKET"
 
 
+class TimeInForce(enum.Enum):
+    GTC = "GTC"  # 立即成交，剩余部分挂入订单簿
+    IOC = "IOC"  # 立即成交，剩余部分自动撤销
+    FOK = "FOK"  # 立即全部成交，否则整单不成交（拒单）
+
+
 class OrderStatus(enum.Enum):
     ACCEPTED = "ACCEPTED"            # 已接受，未成交，挂盘中
     PARTIALLY_FILLED = "PARTIALLY_FILLED"  # 部分成交，剩余挂盘
@@ -33,6 +39,7 @@ class RejectReason(enum.Enum):
     INSUFFICIENT_FUNDS = "INSUFFICIENT_FUNDS"
     INSUFFICIENT_POSITION = "INSUFFICIENT_POSITION"
     NO_LIQUIDITY = "NO_LIQUIDITY"          # 市价单对手方无流动性可估价
+    FOK_NOT_FULLY_FILLABLE = "FOK_NOT_FULLY_FILLABLE"  # FOK 无法立即全部成交，整单失败
     INVALID_ORDER = "INVALID_ORDER"        # 数量/价格非法
     UNKNOWN_SYMBOL = "UNKNOWN_SYMBOL"
 
@@ -50,7 +57,13 @@ class Order:
     status: OrderStatus = OrderStatus.ACCEPTED
     seq: int = 0        # 全局序号，时间优先依据
     reject_reason: RejectReason = RejectReason.NONE
-    frozen_price: int = 0  # 买单冻结单价（限价=price，市价=下单时最优对手价）；卖单为 0
+    frozen_price: int = 0  # 买单冻结单价（限价=price，市价=有效价格上限）；卖单为 0
+    # 成交方式。下单未指定时按旧默认归一化：LIMIT→GTC，MARKET→IOC。
+    time_in_force: TimeInForce = TimeInForce.GTC
+    # 市价单价格保护（分）：买单=可接受最高成交价，卖单=可接受最低成交价；0=未指定。
+    # 市价买未指定时有效上限=下单时最优卖价（即 frozen_price），保证成交总额不超冻结额；
+    # 市价卖未指定时有效下限=0（不约束）。
+    protection_price: int = 0
 
 
 @dataclass
