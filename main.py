@@ -25,6 +25,8 @@ class SubmitOrderRequest(BaseModel):
     order_type: str    # LIMIT / MARKET
     price: int = 0     # 限价（分）；市价单忽略
     quantity: int = Field(gt=0)
+    time_in_force: str | None = None  # GTC / IOC / FOK；不传=限价 GTC、市价 IOC
+    protection_price: int = 0  # 市价单价格保护（分）：买=上限，卖=下限；0=默认口径
 
 
 class DepositRequest(BaseModel):
@@ -46,6 +48,8 @@ def order_view(o: Order) -> dict:
         "filled": o.quantity - o.remaining,
         "status": o.status.value,
         "reject_reason": o.reject_reason.value,
+        "time_in_force": o.time_in_force.value if o.time_in_force else None,
+        "protection_price": o.protection_price,
     }
 
 
@@ -59,7 +63,8 @@ def submit_order(req: SubmitOrderRequest):
     """下单。幂等：同一 idempotency_key 重复提交返回首次结论，不重复执行。"""
     result = engine.submit_order(
         req.idempotency_key, req.account_id, req.symbol,
-        req.side, req.order_type, req.price, req.quantity)
+        req.side, req.order_type, req.price, req.quantity,
+        time_in_force=req.time_in_force, protection_price=req.protection_price)
     body = {
         "accepted": result.accepted,
         "order_id": result.order_id,

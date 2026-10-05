@@ -17,6 +17,7 @@ from engine.models import (
     RejectReason,
     Side,
     SubmitResult,
+    TimeInForce,
     Trade,
 )
 from engine.orderbook import OrderBook
@@ -59,6 +60,8 @@ class MatchingEngine:
             "price": o.price,
             "quantity": o.quantity,
             "frozen_price": o.frozen_price,
+            "time_in_force": o.time_in_force.value if o.time_in_force else None,
+            "protection_price": o.protection_price,
             "idempotency_key": o.order_id,  # 占位，submit 时覆盖
             "seq": o.seq,
         }
@@ -92,7 +95,15 @@ class MatchingEngine:
 
     # ---------- 下单 ----------
     def submit_order(self, idempotency_key: str, account_id: str, symbol: str,
-                     side: str, order_type: str, price: int, quantity: int) -> SubmitResult:
+                     side: str, order_type: str, price: int, quantity: int,
+                     time_in_force: str | None = None,
+                     protection_price: int = 0) -> SubmitResult:
+        """下单。
+
+        time_in_force: None=默认（限价 GTC / 市价 IOC，兼容旧行为）、IOC、FOK、GTC。
+        protection_price: 市价单价格保护（买=成交价上限，卖=成交价下限，单位分），
+                          0=未指定，取默认口径（下单时最优对手价）。
+        """
         with self._lock:
             # 1) 幂等命中：直接回放历史结论，不重新冻结/撮合/扣减
             if idempotency_key in self._idempotency:
@@ -119,19 +130,43 @@ class MatchingEngine:
                 return self._reject(idempotency_key, account_id, symbol,
                                     RejectReason.INVALID_ORDER,
                                     f"非法数量/价格 qty={quantity} price={price}")
+            # 成交方式解析：不传 -> 限价 GTC / 市价 IOC（与旧行为一致）
+            if time_in_force is None:
+                tif = TimeInForce.GTC if type_e is OrderType.LIMIT else TimeInForce.IOC
+            else:
+                try:
+                    tif = TimeInForce(time_in_force)
+                except ValueError:
+                    return self._reject(idempotency_key, account_id, symbol,
+                                        RejectReason.INVALID_ORDER,
+                                        f"非法成交方式 {time_in_force}")
+                if tif is TimeInForce.GTC and type_e is OrderType.MARKET:
+                    return self._reject(idempotency_key, account_id, symbol,
+                                        RejectReason.INVALID_ORDER,
+                                        "市价单不支持 GTC（剩余无法定价挂盘）")
+            # 价格保护仅适用于市价单
+            if protection_price < 0 or (protection_price > 0
+                                        and type_e is OrderType.LIMIT):
+                return self._reject(idempotency_key, account_id, symbol,
+                                    RejectReason.INVALID_ORDER,
+                                    f"价格保护仅市价单可用且需非负 protection_price={protection_price}")
 
             book = self._books[symbol]
 
             # 3) 风控：估值 -> 冻结（检查与变更原子，杜绝超额占用/超卖）
+            #    市价买单按价格保护价冻结，保证成交总额不超过下单时锁定额度。
             frozen_price = 0
+            eff_protection = 0
             if side_e is Side.BUY:
                 if type_e is OrderType.MARKET:
                     best = book.best_ask()
-                    if best is None:
+                    if best is None and protection_price == 0:
                         return self._reject(idempotency_key, account_id, symbol,
                                             RejectReason.NO_LIQUIDITY,
                                             "市价买单对手方无报价，无法估算冻结额")
-                    frozen_price = best.price
+                    # 默认口径：未指定保护价时按下单时最优卖一价冻结与保护
+                    eff_protection = protection_price or best.price
+                    frozen_price = eff_protection
                 else:
                     frozen_price = price
                 if not self._ledger.freeze_cash(account_id, frozen_price * quantity):
@@ -139,6 +174,10 @@ class MatchingEngine:
                                         RejectReason.INSUFFICIENT_FUNDS,
                                         f"需冻结 {frozen_price * quantity} 分")
             else:
+                if type_e is OrderType.MARKET:
+                    best = book.best_bid()
+                    # 默认口径：未指定时下限=下单时最优买一价；无买一则 0（不设限）
+                    eff_protection = protection_price or (best.price if best else 0)
                 if not self._ledger.freeze_position(account_id, symbol, quantity):
                     return self._reject(idempotency_key, account_id, symbol,
                                         RejectReason.INSUFFICIENT_POSITION,
@@ -149,39 +188,89 @@ class MatchingEngine:
             order = Order(
                 order_id=f"O{seq}", account_id=account_id, symbol=symbol,
                 side=side_e, order_type=type_e, price=price, quantity=quantity,
-                remaining=quantity, seq=seq, frozen_price=frozen_price)
+                remaining=quantity, seq=seq, frozen_price=frozen_price,
+                time_in_force=tif, protection_price=eff_protection)
             self._orders[order.order_id] = order
             self._idempotency[idempotency_key] = order.order_id
             ev = self._order_to_event(order)
             ev["idempotency_key"] = idempotency_key
             self._store.append(ev)
-            log.info("order accepted id=%s key=%s account=%s %s %s qty=%s price=%s",
+            log.info("order accepted id=%s key=%s account=%s %s %s qty=%s price=%s "
+                     "tif=%s protection=%s",
                      order.order_id, idempotency_key, account_id, side_e.value,
-                     type_e.value, quantity, price)
+                     type_e.value, quantity, price, tif.value, eff_protection)
 
-            # 5) 撮合
+            # 5) FOK 预检：价格边界内可成交量不足则整单原子失败
+            if tif is TimeInForce.FOK:
+                fillable = self._fillable_qty(order)
+                if fillable < quantity:
+                    self._rollback_to_rejected(order, idempotency_key,
+                                               RejectReason.FOK_UNFILLABLE)
+                    log.info("order decision id=%s key=%s tif=FOK fillable=%s/%s "
+                             "fok_all_or_nothing=False status=REJECTED "
+                             "reason=FOK_UNFILLABLE (冻结已释放，账务未变)",
+                             order.order_id, idempotency_key, fillable, quantity)
+                    return SubmitResult(order.order_id, False, OrderStatus.REJECTED,
+                                        RejectReason.FOK_UNFILLABLE)
+                log.info("fok precheck ok id=%s fillable=%s/%s fok_all_or_nothing=True",
+                         order.order_id, fillable, quantity)
+
+            # 6) 撮合
             trades = self._match(order)
 
-            # 6) 剩余处理
-            if order.remaining > 0 and type_e is OrderType.MARKET:
-                # 市价单(IOC)：未成交部分立即撤销并释放冻结
-                self._cancel_remaining(order, reason="MARKET_IOC", log_it=False)
+            # 7) 剩余处理
+            if order.remaining > 0 and tif is not TimeInForce.GTC:
+                # IOC / 市价单：未成交部分立即撤销并释放冻结
+                self._cancel_remaining(order, reason=f"{tif.value}_REMAINDER",
+                                       log_it=False)
             elif order.remaining > 0:
                 book.add(order)
                 if order.remaining < order.quantity:
                     order.status = OrderStatus.PARTIALLY_FILLED
-                log.info("order resting id=%s remaining=%s status=%s",
+                log.info("order resting id=%s remaining=%s status=%s decision=REST",
                          order.order_id, order.remaining, order.status.value)
             else:
                 order.status = OrderStatus.FILLED
 
             result = SubmitResult(order.order_id, True, order.status,
                                   RejectReason.NONE, trades)
-            log.info("order decision id=%s key=%s filled=%s/%s status=%s trades=%d",
-                     order.order_id, idempotency_key,
+            log.info("order decision id=%s key=%s tif=%s protection=%s filled=%s/%s "
+                     "status=%s remainder=%s trades=%d",
+                     order.order_id, idempotency_key, tif.value, eff_protection,
                      order.quantity - order.remaining, order.quantity,
-                     order.status.value, len(trades))
+                     order.status.value,
+                     "CANCELLED" if order.status is OrderStatus.CANCELLED
+                     else ("REST" if not order.status.is_terminal else "NONE"),
+                     len(trades))
             return result
+
+    def _fillable_qty(self, order: Order) -> int:
+        """价格边界内当前可成交总量（用于 FOK 预检，不改变任何状态）。"""
+        book = self._books[order.symbol]
+        makers = book.iter_asks() if order.side is Side.BUY else book.iter_bids()
+        total = 0
+        for m in makers:
+            if self._bound_exceeded(order, m.price):
+                break
+            total += m.remaining
+        return total
+
+    def _rollback_to_rejected(self, order: Order, key: str,
+                              reason: RejectReason) -> None:
+        """已接受订单在撮合前原子失败：全额释放冻结并置终态 REJECTED。"""
+        if order.side is Side.BUY:
+            self._ledger.unfreeze_cash(
+                order.account_id, order.frozen_price * order.remaining)
+        else:
+            self._ledger.unfreeze_position(
+                order.account_id, order.symbol, order.remaining)
+        order.status = OrderStatus.REJECTED
+        order.reject_reason = reason
+        self._rejections[key] = reason
+        self._store.append({"type": "ORDER_REJECTED", "idempotency_key": key,
+                            "order_id": order.order_id,
+                            "account_id": order.account_id, "symbol": order.symbol,
+                            "reason": reason.value})
 
     def _reject(self, key: str, account_id: str, symbol: str,
                 reason: RejectReason, detail: str) -> SubmitResult:
@@ -196,6 +285,12 @@ class MatchingEngine:
     def _duplicate_result(self, key: str) -> SubmitResult:
         oid = self._idempotency[key]
         order = self._orders[oid]
+        # 已接受后又被置为 REJECTED 的订单（如 FOK 整单失败）：回放同一拒绝结论
+        if order.status is OrderStatus.REJECTED:
+            log.info("order duplicate key=%s id=%s status=REJECTED reason=%s "
+                     "(no re-execution)", key, oid, order.reject_reason.value)
+            return SubmitResult(oid, False, OrderStatus.REJECTED,
+                                order.reject_reason, duplicate=True)
         trades = [t for t in self._trades
                   if t.buy_order_id == oid or t.sell_order_id == oid]
         log.info("order duplicate key=%s id=%s status=%s trades=%d (no re-execution)",
@@ -204,6 +299,21 @@ class MatchingEngine:
                             trades, duplicate=True)
 
     # ---------- 撮合 ----------
+    @staticmethod
+    def _price_bound(order: Order) -> int:
+        """可成交价格边界：限价单=限价；市价单=价格保护价。返回 0 表示不设限。"""
+        if order.order_type is OrderType.LIMIT:
+            return order.price
+        return order.protection_price
+
+    def _bound_exceeded(self, order: Order, maker_price: int) -> bool:
+        bound = self._price_bound(order)
+        if bound == 0:
+            return False
+        if order.side is Side.BUY:
+            return maker_price > bound
+        return maker_price < bound
+
     def _match(self, order: Order) -> list[Trade]:
         book = self._books[order.symbol]
         makers = book.iter_asks() if order.side is Side.BUY else book.iter_bids()
@@ -211,11 +321,12 @@ class MatchingEngine:
         for maker in makers:
             if order.remaining == 0:
                 break
-            if order.order_type is OrderType.LIMIT:
-                if order.side is Side.BUY and maker.price > order.price:
-                    break
-                if order.side is Side.SELL and maker.price < order.price:
-                    break
+            if self._bound_exceeded(order, maker.price):
+                log.info("price protection hit id=%s side=%s maker_price=%s bound=%s "
+                         "remaining=%s decision=STOP",
+                         order.order_id, order.side.value, maker.price,
+                         self._price_bound(order), order.remaining)
+                break
             qty = min(order.remaining, maker.remaining)
             price = maker.price  # 成交价取挂单价（maker price）
             if order.side is Side.BUY:
@@ -326,12 +437,19 @@ class MatchingEngine:
         elif t == "DEPOSIT_POSITION":
             self._ledger.deposit_position(e["account_id"], e["symbol"], e["qty"])
         elif t == "ORDER_ACCEPTED":
+            order_type = OrderType(e["order_type"])
+            # 旧 WAL 无新字段：按默认口径解析（限价 GTC / 市价 IOC，保护价 0）
+            tif_raw = e.get("time_in_force")
+            tif = (TimeInForce(tif_raw) if tif_raw else
+                   (TimeInForce.GTC if order_type is OrderType.LIMIT
+                    else TimeInForce.IOC))
             order = Order(
                 order_id=e["order_id"], account_id=e["account_id"], symbol=e["symbol"],
-                side=Side(e["side"]), order_type=OrderType(e["order_type"]),
+                side=Side(e["side"]), order_type=order_type,
                 price=e["price"], quantity=e["quantity"], remaining=e["quantity"],
                 status=OrderStatus.ACCEPTED, seq=e["seq"],
-                frozen_price=e["frozen_price"])
+                frozen_price=e["frozen_price"], time_in_force=tif,
+                protection_price=e.get("protection_price", 0))
             if order.side is Side.BUY:
                 assert self._ledger.freeze_cash(
                     order.account_id, order.frozen_price * order.quantity)
@@ -343,6 +461,19 @@ class MatchingEngine:
             self._idempotency[e["idempotency_key"]] = order.order_id
         elif t == "ORDER_REJECTED":
             self._rejections[e["idempotency_key"]] = RejectReason(e["reason"])
+            # 新事件可带 order_id（FOK 等"接受后失败"）：回放释放冻结并置终态；
+            # 旧事件无 order_id（接受前拒绝）：仅记录幂等拒绝结论。
+            oid = e.get("order_id")
+            if oid:
+                order = self._orders[oid]
+                if order.side is Side.BUY:
+                    self._ledger.unfreeze_cash(
+                        order.account_id, order.frozen_price * order.remaining)
+                else:
+                    self._ledger.unfreeze_position(
+                        order.account_id, order.symbol, order.remaining)
+                order.status = OrderStatus.REJECTED
+                order.reject_reason = RejectReason(e["reason"])
         elif t == "TRADE":
             buy = self._orders[e["buy_order_id"]]
             sell = self._orders[e["sell_order_id"]]
